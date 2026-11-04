@@ -1,0 +1,79 @@
+# Local Spree backend for Vantage Supplements.
+#
+#   cp .env.example .env        # fill in GOOGLE_CLIENT_ID at minimum
+#   docker compose up -d --build --wait
+#   npx @spree/cli seed
+#
+# Storefront API:  http://localhost:4000/api/v3/store
+# Admin API:       http://localhost:4000/api/v3/admin
+# Spree Admin UI:  http://localhost:4000/admin
+
+name: vantage-backend
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-spree}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-spree}
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: pg_isready -U ${POSTGRES_USER:-spree}
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: redis-cli ping
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.13
+    profiles: ["search"] # opt in: docker compose --profile search up
+    environment:
+      MEILI_MASTER_KEY: ${MEILISEARCH_MASTER_KEY:-dev_master_key_change_me}
+    volumes:
+      - meili:/meili_data
+
+  web:
+    build:
+      context: .
+      args:
+        SPREE_IMAGE: ${SPREE_IMAGE:-ghcr.io/spree/spree:latest}
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-spree}:${POSTGRES_PASSWORD:-spree}@postgres:5432/vantage_${RAILS_ENV:-development}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports:
+      - "4000:3000"
+    healthcheck:
+      test: curl -f http://localhost:3000/up || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  worker:
+    build:
+      context: .
+      args:
+        SPREE_IMAGE: ${SPREE_IMAGE:-ghcr.io/spree/spree:latest}
+    command: bin/jobs
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-spree}:${POSTGRES_PASSWORD:-spree}@postgres:5432/vantage_${RAILS_ENV:-development}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      web: { condition: service_healthy }
+
+volumes:
+  pgdata:
+  meili:
