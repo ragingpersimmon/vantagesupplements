@@ -87,10 +87,13 @@ vantage-supplements/
 
 ## Idempotency of the welcome discount
 
+Spree does **not** enforce unique promotion codes (no validation, non-unique index), so uniqueness is handled in the storefront:
+
 | Layer | Protects against |
 |---|---|
 | `metadata.welcome_discount_issued` on the Spree customer | callback refresh, repeat sign-ins |
-| Code = HMAC(customer ID) + Spree's unique-code constraint | two simultaneous requests: the loser's create fails, and it sends no email |
+| Code = HMAC(customer ID); look the code up before creating | a retry after an attempt that created the promotion but failed before setting the flag |
+| After creating, list all promotions with that code; the oldest wins and the rest are deleted | two simultaneous requests. Worst case, the same code is emailed twice; a second working coupon can't survive |
 | `orders_count > 0` → ineligible; promotion has `first_order` + `customer` rules | existing customers; leaked or forwarded codes |
 
 Email failure doesn't roll anything back. The coupon is flagged and can be resent from the code stored on the customer.
@@ -104,16 +107,15 @@ Email failure doesn't roll anything back. The coupon is flagged and can be resen
 cd backend
 cp .env.example .env            # set SECRET_KEY_BASE, GOOGLE_CLIENT_ID
 docker compose up -d --build --wait
-npx @spree/cli seed             # creates the store + first admin (ADMIN_EMAIL/PASSWORD)
+docker compose exec web bin/rails db:seed   # store + first admin (ADMIN_EMAIL/PASSWORD)
 #  Spree Admin → Settings: set store currency CAD, default country Canada,
 #  and create a "Canada" market (CAD, en + fr). Add a stock location.
 
 # 2. API keys (three keys, least privilege)
-npx @spree/cli api-key create --name storefront --type publishable
-npx @spree/cli api-key create --name storefront-runtime --type secret \
-  --scopes read_customers,write_customers,read_promotions,write_promotions
-npx @spree/cli api-key create --name seed --type secret \
-  --scopes write_settings,write_delivery_methods,write_products,read_all
+key() { docker compose exec -e NAME="$1" -e KEY_TYPE="$2" -e SCOPES="$3" web bin/rails spree:cli:create_api_key; }
+key storefront publishable
+key storefront-runtime secret read_customers,write_customers,read_promotions,write_promotions
+key seed secret write_settings,write_delivery_methods,write_products,read_all
 
 # 3. Seed tax, shipping, catalogue
 cd ../scripts
@@ -143,7 +145,9 @@ pnpm test:e2e    # Playwright (spins up its own Spree)
 
 ## Production notes
 
-- **Pin `SPREE_IMAGE`** to an exact tag. The backend Dockerfile assumes the image's app root is `/rails`. Check this when upgrading.
+- **Hosting**: `render.yaml` is a Render Blueprint for the API, the worker and Postgres. The storefront goes on Vercel with project root `storefront/`.
+- **Pin `SPREE_IMAGE`** to an exact tag. The backend Dockerfile relies on the image's app root being `/rails` and on the `rails` user (verified against spree-starter's Dockerfile).
+- **`RAILS_ENV` must be `production`** even locally. The official image ships without development gems.
 - **Secrets**: `SPREE_ADMIN_API_KEY` and `WELCOME_DISCOUNT_SECRET` are server-only env vars on Vercel. **Revoke the seed key** after go-live.
 - **Google**: add production origins to the OAuth client. Once sign-in volume grows, publish the OAuth consent screen (the scopes are basic `openid email profile`).
 - **Performance**: the GIS script loads with `lazyOnload` and the button reserves its height, so it adds no LCP or CLS cost. Product facts come from the same server-side listing fetch (`expand: custom_fields`), so there's no client waterfall. Re-run Lighthouse mobile after theming; the upstream baseline is 98.

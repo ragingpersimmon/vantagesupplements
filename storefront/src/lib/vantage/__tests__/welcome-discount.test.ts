@@ -1,12 +1,11 @@
 // @vitest-environment node
-import { SpreeError } from "@spree/admin-sdk";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("server-only", () => ({}));
 
 const admin = {
   customers: { get: vi.fn(), update: vi.fn() },
-  promotions: { create: vi.fn() },
+  promotions: { create: vi.fn(), list: vi.fn(), delete: vi.fn() },
 };
 vi.mock("../admin-client", () => ({ getAdminClient: () => admin }));
 
@@ -36,6 +35,14 @@ beforeEach(() => {
   vi.resetAllMocks();
   process.env.WELCOME_DISCOUNT_SECRET = SECRET;
   process.env.WELCOME_DISCOUNT_PERCENT = "15";
+  // Default: no pre-existing promotion; after create, only ours exists.
+  admin.promotions.create.mockResolvedValue({ id: "promo_2" });
+  admin.promotions.list
+    .mockResolvedValueOnce({ data: [] })
+    .mockResolvedValueOnce({
+      data: [{ id: "promo_2", created_at: new Date().toISOString() }],
+    });
+  admin.promotions.delete.mockResolvedValue(undefined);
 });
 
 describe("welcomeCodeFor", () => {
@@ -97,24 +104,53 @@ describe("issueWelcomeDiscount", () => {
     expect(sendEmail).not.toHaveBeenCalled();
   });
 
-  it("backs off without emailing when a concurrent request already created the code", async () => {
+  it("reuses a promotion an interrupted earlier attempt created, without emailing", async () => {
     admin.customers.get.mockResolvedValue(customer());
-    admin.promotions.create.mockRejectedValue(
-      new SpreeError(
-        {
-          error: {
-            code: "validation_error",
-            message: "Invalid",
-            details: { code: ["has already been taken"] },
-          },
-        },
-        422,
-      ),
-    );
+    admin.promotions.list.mockReset();
+    admin.promotions.list.mockResolvedValue({
+      data: [{ id: "promo_1", created_at: "2026-11-01T00:00:00Z" }],
+    });
     const result = await issueWelcomeDiscount("cus_abc");
     expect(result.status).toBe("already_issued");
+    expect(admin.promotions.create).not.toHaveBeenCalled();
+    expect(
+      admin.customers.update.mock.calls[0][1].metadata.welcome_discount_issued,
+    ).toBe(true);
+    expect(sendEmail).not.toHaveBeenCalled();
+  });
+
+  it("loses a concurrent race: deletes its own copy, sends no email", async () => {
+    admin.customers.get.mockResolvedValue(customer());
+    admin.promotions.list.mockReset();
+    admin.promotions.list
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: [{ id: "promo_1" }, { id: "promo_2" }] });
+    const result = await issueWelcomeDiscount("cus_abc");
+    expect(result.status).toBe("already_issued");
+    expect(admin.promotions.delete).toHaveBeenCalledWith("promo_2");
     expect(admin.customers.update).not.toHaveBeenCalled();
     expect(sendEmail).not.toHaveBeenCalled();
+  });
+
+  it("wins a concurrent race: deletes the newer duplicate and emails once", async () => {
+    admin.customers.get.mockResolvedValue(customer());
+    admin.promotions.create.mockResolvedValue({ id: "promo_1" });
+    admin.promotions.list.mockReset();
+    admin.promotions.list
+      .mockResolvedValueOnce({ data: [] })
+      .mockResolvedValueOnce({ data: [{ id: "promo_1" }, { id: "promo_2" }] });
+    const result = await issueWelcomeDiscount("cus_abc");
+    expect(result.status).toBe("issued");
+    expect(admin.promotions.delete).toHaveBeenCalledWith("promo_2");
+    expect(sendEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it("looks codes up lowercased (Spree downcases stored codes)", async () => {
+    admin.customers.get.mockResolvedValue(customer());
+    await issueWelcomeDiscount("cus_abc");
+    const filter = admin.promotions.list.mock.calls[0][0];
+    expect(filter.code_eq).toBe(filter.code_eq.toLowerCase());
+    expect(filter.sort).toBe("id");
   });
 
   it("skips customers who already have orders", async () => {

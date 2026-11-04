@@ -31,6 +31,7 @@ Spree Admin is at `http://localhost:4000/admin` locally (your API host + `/admin
    | Servings per container | `30` | Used for the "price per serving" figure |
    | Flavours | `["Chocolate","Vanilla"]` | JSON list, the summary shown on cards. Keep it in sync with the Flavour variants |
    | Dietary tags | `["Vegan","Gluten-free"]` | First 3 show as chips on the card |
+   | NPN | `80012345` | Health Canada Natural Product Number. Shown on the product page. **Don't activate a supplement without one** |
 
 7. **Shipping**: give each variant a **weight**. The current methods are flat-rate, but weight lets you switch to carrier rates (Canada Post, etc.) without re-entering data.
 8. **Stock**: set the count on hand per stock location.
@@ -64,6 +65,8 @@ When a new shopper signs up with Google, the storefront automatically:
 3. sets the **usage limit** to 1 and the **expiry** to 30 days
 4. emails the code and shows it in an on-screen toast
 5. marks the customer (`metadata.welcome_discount_issued = true`) so it is never issued twice
+
+Spree does **not** enforce unique promotion codes. Never hand-create a promotion whose code starts with `VANTAGE-WELCOME-`, because the storefront treats an existing code as already issued.
 
 Settings live in the storefront env: `WELCOME_DISCOUNT_PERCENT`, `WELCOME_DISCOUNT_TTL_DAYS`, `WELCOME_DISCOUNT_ENABLED`.
 
@@ -99,6 +102,6 @@ For campaigns where you want N unique single-use codes that **aren't** tied to a
 
 ## 4. Compliance reminders
 
-- **Health Canada**: supplements sold in Canada need a **Natural Product Number (NPN)** and bilingual labelling. Add the NPN to the product description, or add a `vantage.npn` custom field.
+- **Health Canada**: supplements sold in Canada need a **Natural Product Number (NPN)** and bilingual labelling. Enter it in the product's **NPN** custom field.
 - **Quebec**: Charter of the French Language rules apply to product information. The storefront ships with `fr` messages; translate product content too.
 - **Tax registration**: you must be registered to collect BC PST, MB RST, SK PST and QST before charging them. See `docs/tax-compliance.md`.

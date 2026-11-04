@@ -24,6 +24,9 @@ const FIELD_DEFS = [
   { key: "servings", label: "Servings per container", field_type: "number" },
   { key: "flavors", label: "Flavours", field_type: "json" },
   { key: "dietary_tags", label: "Dietary tags", field_type: "json" },
+  // Health Canada Natural Product Number (8 digits). Shown on the product page
+  // via the storefront's custom-fields block. Required before selling.
+  { key: "npn", label: "NPN", field_type: "short_text" },
 ] as const;
 
 type Demo = {
@@ -35,6 +38,8 @@ type Demo = {
   compareAt?: string;
   flavors: string[];
   facts: { protein_per_serving?: number; servings?: number; dietary_tags: string[] };
+  /** Placeholder only. Replace with the real licence number from Health Canada. */
+  npn?: string;
 };
 
 const DEMO: Demo[] = [
@@ -173,6 +178,7 @@ async function main() {
       p.facts.servings !== undefined && { custom_field_definition_id: fieldIds.servings, value: p.facts.servings },
       p.flavors.length && { custom_field_definition_id: fieldIds.flavors, value: p.flavors },
       p.facts.dietary_tags.length && { custom_field_definition_id: fieldIds.dietary_tags, value: p.facts.dietary_tags },
+      p.npn && { custom_field_definition_id: fieldIds.npn, value: p.npn },
     ].filter(Boolean) as { custom_field_definition_id: string; value: unknown }[];
 
     log("create", `${p.name} — $${p.price} CAD, ${p.flavors.length || 1} variant(s), tax: ${TAX_CATEGORIES[p.tax].name}`);

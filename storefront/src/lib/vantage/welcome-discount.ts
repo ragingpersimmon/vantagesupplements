@@ -1,7 +1,6 @@
 import "server-only";
 
 import { createHmac } from "node:crypto";
-import { SpreeError } from "@spree/admin-sdk";
 import { sendEmail } from "@/lib/emails/send";
 import { WelcomeDiscountEmail } from "@/lib/emails/welcome-discount";
 import { getAdminClient } from "./admin-client";
@@ -10,17 +9,22 @@ import { getAdminClient } from "./admin-client";
  * Welcome discount issuance: one single-use, customer-locked, first-order coupon
  * per customer.
  *
- * Idempotency is enforced in three layers, so refreshing the OAuth callback,
- * double-clicking One Tap, or two concurrent tabs can never mint two coupons:
+ * Idempotency layers. NOTE: Spree does NOT enforce unique promotion codes (no
+ * validation, non-unique index), so uniqueness is enforced here:
  *
- *  1. Flag: the customer's Spree metadata holds `welcome_discount_issued` and
- *     the code. If it's set, return the existing code and send nothing.
- *  2. Deterministic code: the code is an HMAC of the customer ID, so a racing
- *     second request computes the SAME code. Spree enforces unique promotion
- *     codes, so the loser's create fails and it backs off without emailing.
- *  3. Eligibility: customers with completed orders are skipped, and the
- *     promotion itself carries `first_order` + `customer` rules, so even a
- *     leaked code is unusable by anyone else or on a second order.
+ *  1. Flag: the customer's metadata holds `welcome_discount_issued` + the code.
+ *     Set → return the existing code, send nothing.
+ *  2. Lookup before create: the code is an HMAC of the customer ID, so if a
+ *     promotion with that code exists (e.g. an earlier attempt created it but
+ *     failed before setting the flag) we reuse it instead of creating another.
+ *  3. Reconcile after create: two concurrent requests can both pass 1–2. After
+ *     creating, each lists every promotion holding the code; the oldest (lowest
+ *     id) survives and every other copy is deleted. Only the survivor's request
+ *     sends the email. Worst case under a tight race: the same code is emailed
+ *     twice. A second working coupon cannot survive.
+ *  4. Eligibility: customers with completed orders are skipped, and the
+ *     promotion carries `customer` + `first_order` rules, so a leaked code is
+ *     unusable by anyone else or on a second order.
  */
 
 const METADATA_FLAG = "welcome_discount_issued";
@@ -60,16 +64,6 @@ export function welcomeCodeFor(customerId: string, secret: string): string {
   return `VANTAGE-WELCOME-${out}`;
 }
 
-function isDuplicateCode(error: unknown): boolean {
-  return (
-    error instanceof SpreeError &&
-    error.status === 422 &&
-    JSON.stringify(error.details ?? {})
-      .toLowerCase()
-      .includes("code")
-  );
-}
-
 export async function issueWelcomeDiscount(
   customerId: string,
 ): Promise<WelcomeDiscountResult> {
@@ -97,51 +91,83 @@ export async function issueWelcomeDiscount(
   const startsAt = new Date();
   const expiresAt = new Date(startsAt.getTime() + cfg.ttlDays * 86_400_000);
 
-  // Layer 2 — deterministic code + Spree's unique-code constraint.
-  try {
-    await admin.promotions.create({
-      name: `Welcome ${cfg.percent}% — ${customer.email}`,
-      description: `Auto-issued on Google sign-up for ${customer.id}`,
-      kind: "coupon_code",
+  // Spree stores codes lowercased; lookups must match that.
+  const holders = async () =>
+    (
+      await admin.promotions.list({
+        code_eq: code.toLowerCase(),
+        sort: "id",
+        limit: 25,
+      })
+    ).data;
+
+  // Layer 2 — reuse a promotion an earlier, interrupted attempt created.
+  const existing = await holders();
+  if (existing.length > 0) {
+    await markIssued(
+      customer.id,
+      metadata,
       code,
-      usage_limit: 1,
-      starts_at: startsAt.toISOString(),
-      expires_at: expiresAt.toISOString(),
-      match_policy: "all",
-      promotion_category_id: cfg.promotionCategoryId,
-      rules: [
-        // Only this customer may redeem it…
-        { type: "customer", customer_ids: [customer.id] },
-        // …and only on their first completed order.
-        { type: "first_order" },
-      ],
-      actions: [
-        {
-          type: "create_adjustment",
-          calculator: {
-            type: "flat_percent_item_total",
-            preferences: { flat_percent: cfg.percent },
-          },
-        },
-      ],
-    });
-  } catch (error) {
-    if (isDuplicateCode(error)) {
-      // A concurrent request won the race and owns the email send.
-      return { status: "already_issued", code };
-    }
-    throw error;
+      new Date(existing[0].created_at),
+    );
+    return { status: "already_issued", code };
   }
 
-  // Merge, don't replace: metadata is a single JSON column on the customer.
-  await admin.customers.update(customer.id, {
-    metadata: {
-      ...metadata,
-      [METADATA_FLAG]: true,
-      [METADATA_CODE]: code,
-      [METADATA_ISSUED_AT]: startsAt.toISOString(),
-    },
+  const created = await admin.promotions.create({
+    name: `Welcome ${cfg.percent}% — ${customer.email}`,
+    description: `Auto-issued on sign-up for ${customer.id}`,
+    kind: "coupon_code",
+    code,
+    usage_limit: 1,
+    starts_at: startsAt.toISOString(),
+    expires_at: expiresAt.toISOString(),
+    match_policy: "all",
+    promotion_category_id: cfg.promotionCategoryId,
+    rules: [
+      // Only this customer may redeem it…
+      { type: "customer", customer_ids: [customer.id] },
+      // …and only on their first completed order.
+      { type: "first_order" },
+    ],
+    actions: [
+      {
+        type: "create_adjustment",
+        calculator: {
+          type: "flat_percent_item_total",
+          preferences: { flat_percent: cfg.percent },
+        },
+      },
+    ],
   });
+
+  // Layer 3 — reconcile a concurrent duplicate: oldest wins, others delete.
+  const all = await holders();
+  const winner = all[0];
+  if (winner && winner.id !== created.id) {
+    await admin.promotions.delete(created.id).catch((error) => {
+      console.error(
+        "[welcome-discount] failed to delete duplicate",
+        created.id,
+        error,
+      );
+    });
+    return { status: "already_issued", code };
+  }
+  await Promise.all(
+    all
+      .filter((p) => p.id !== created.id)
+      .map((p) =>
+        admin.promotions.delete(p.id).catch((error) => {
+          console.error(
+            "[welcome-discount] failed to delete duplicate",
+            p.id,
+            error,
+          );
+        }),
+      ),
+  );
+
+  await markIssued(customer.id, metadata, code, startsAt);
 
   try {
     await sendEmail({
@@ -161,4 +187,21 @@ export async function issueWelcomeDiscount(
   }
 
   return { status: "issued", code, expiresAt: expiresAt.toISOString() };
+}
+
+async function markIssued(
+  customerId: string,
+  metadata: Record<string, unknown>,
+  code: string,
+  issuedAt: Date,
+) {
+  // Merge, don't replace: metadata is a single JSON column on the customer.
+  await getAdminClient().customers.update(customerId, {
+    metadata: {
+      ...metadata,
+      [METADATA_FLAG]: true,
+      [METADATA_CODE]: code,
+      [METADATA_ISSUED_AT]: issuedAt.toISOString(),
+    },
+  });
 }

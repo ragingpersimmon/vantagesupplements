@@ -14,20 +14,13 @@ services:
   postgres:
     image: postgres:18-alpine
     environment:
+      PGDATA: /var/lib/postgresql/18/docker
       POSTGRES_USER: ${POSTGRES_USER:-spree}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-spree}
     volumes:
       - pgdata:/var/lib/postgresql
     healthcheck:
       test: pg_isready -U ${POSTGRES_USER:-spree}
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
-  redis:
-    image: redis:7-alpine
-    healthcheck:
-      test: redis-cli ping
       interval: 5s
       timeout: 5s
       retries: 10
@@ -47,11 +40,9 @@ services:
         SPREE_IMAGE: ${SPREE_IMAGE:-ghcr.io/spree/spree:latest}
     env_file: .env
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-spree}:${POSTGRES_PASSWORD:-spree}@postgres:5432/vantage_${RAILS_ENV:-development}
-      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgres://${POSTGRES_USER:-spree}:${POSTGRES_PASSWORD:-spree}@postgres:5432/vantage_${RAILS_ENV:-production}
     depends_on:
       postgres: { condition: service_healthy }
-      redis: { condition: service_healthy }
     ports:
       - "4000:3000"
     healthcheck:
@@ -69,8 +60,7 @@ services:
     command: bin/jobs
     env_file: .env
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-spree}:${POSTGRES_PASSWORD:-spree}@postgres:5432/vantage_${RAILS_ENV:-development}
-      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgres://${POSTGRES_USER:-spree}:${POSTGRES_PASSWORD:-spree}@postgres:5432/vantage_${RAILS_ENV:-production}
     depends_on:
       web: { condition: service_healthy }
 
