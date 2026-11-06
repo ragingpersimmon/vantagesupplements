@@ -15,20 +15,10 @@
  */
 import { adminClient, DRY_RUN, listAll, log } from "./lib/admin";
 import { TAX_CATEGORIES } from "./lib/ca-tax-data";
+import { FIELD_DEFS, FIELD_NAMESPACE as NAMESPACE } from "./lib/custom-fields";
 import { DEMO } from "./lib/demo-catalogue";
 
 const admin = adminClient();
-const NAMESPACE = "vantage";
-
-const FIELD_DEFS = [
-  { key: "protein_per_serving", label: "Protein per serving (g)", field_type: "number" },
-  { key: "servings", label: "Servings per container", field_type: "number" },
-  { key: "flavors", label: "Flavours", field_type: "json" },
-  { key: "dietary_tags", label: "Dietary tags", field_type: "json" },
-  // Health Canada Natural Product Number (8 digits). Shown on the product page
-  // via the storefront's custom-fields block. Required before selling.
-  { key: "npn", label: "NPN", field_type: "short_text" },
-] as const;
 
 async function ensureFieldDefinitions() {
   const existing = await listAll((page) => admin.customFieldDefinitions.list({ page, limit: 100 }));
@@ -51,8 +41,6 @@ async function ensureFieldDefinitions() {
             namespace: NAMESPACE,
             resource_type: "product",
             storefront_visible: true,
-            // Lets shoppers filter by e.g. "Vegan" when Meilisearch is on.
-            searchable: def.key === "dietary_tags",
           })
         ).id;
   }
@@ -86,9 +74,10 @@ async function ensureFlavourOptionType() {
 async function main() {
   console.log(`Seeding products${DRY_RUN ? " — DRY RUN" : ""}\n`);
 
-  const [taxCategories, stockLocations] = await Promise.all([
+  const [taxCategories, stockLocations, channels] = await Promise.all([
     listAll((page) => admin.taxCategories.list({ page, limit: 100 })),
     listAll((page) => admin.stockLocations.list({ page, limit: 100 })),
+    listAll((page) => admin.channels.list({ page, limit: 100 })),
   ]);
   const taxId = (key: keyof typeof TAX_CATEGORIES) => {
     const cat = taxCategories.find((c) => c.tax_code === TAX_CATEGORIES[key].tax_code);
@@ -97,14 +86,24 @@ async function main() {
   };
   const stockLocationId = stockLocations[0]?.id;
   if (!stockLocationId) throw new Error("No stock location found. Create one in Spree Admin → Settings → Locations.");
+  // The Store API only lists products published on its channel.
+  const channel = channels.find((c) => c.default);
+  if (!channel) throw new Error("No default sales channel found (Spree Admin → Settings → Channels).");
 
   const fieldIds = await ensureFieldDefinitions();
   await ensureFlavourOptionType();
 
   for (const p of DEMO) {
-    const existing = await admin.products.list({ slug_eq: p.slug, limit: 1 });
-    if (existing.data.length) {
-      log("skip", `${p.name} (exists — edit in Spree Admin)`);
+    const existing = await admin.products.list({ slug_eq: p.slug, limit: 1, expand: ["product_publications"] });
+    const found = existing.data[0];
+    if (found) {
+      // Publish once if it never was; a product unpublished in Spree Admin stays unpublished.
+      if (!found.product_publications?.length) {
+        log("update", `${p.name} → publish on channel ${channel.name}`);
+        if (!DRY_RUN) await admin.products.bulkAddToChannels({ ids: [found.id], channel_ids: [channel.id] });
+      } else {
+        log("skip", `${p.name} (exists — edit in Spree Admin)`);
+      }
       continue;
     }
 
@@ -141,6 +140,7 @@ async function main() {
         prices,
         stock_levels: [{ stock_location_id: stockLocationId, count_on_hand: 100 }],
       })),
+      product_publications: [{ channel_id: channel.id }],
     });
   }
 
