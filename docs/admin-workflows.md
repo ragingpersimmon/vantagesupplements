@@ -46,11 +46,11 @@ Spree 6 replaces "shipping categories" with **delivery methods + rules**. The se
 | Shopper sees | Cart subtotal | Price |
 |---|---|---|
 | Standard (5–7 business days) | under $75 | $12.99 |
-| Standard (5–7 business days) | $75 and up | **Free** |
+| Standard (5–7 business days) — free | $75 and up | **Free** |
 | Expedited (2–3 business days) | under $150 | $24.99 |
-| Expedited (2–3 business days) | $150 and up | $14.99 |
+| Expedited (2–3 business days) — reduced | $150 and up | $14.99 |
 
-Change prices or thresholds in `scripts/seed-ca-tax.ts` (`SHIPPING`) and re-run `pnpm seed:tax`, or edit them under **Settings → Delivery methods**. All four carry the **Shipping** tax category, which is how tax on shipping is controlled per province. Don't remove it.
+Spree requires delivery method names to be unique, hence the suffixes. Change prices or thresholds in `scripts/lib/shipping-data.ts` (`SHIPPING`) and re-run `pnpm seed:tax`, or edit them under **Settings → Delivery methods**. All four carry the **Shipping** tax category, which is how tax on shipping is controlled per province. Don't remove it. `pnpm verify:tax` checks the tiers and the tax end to end.
 
 ---
 

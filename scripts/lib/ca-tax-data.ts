@@ -22,7 +22,10 @@
  *    (PSTERR s.3(2)(a); Bulletin PST 206/207).
  *  - MB: dietary supplements remain RST-taxable (only prenatal vitamins became
  *    exempt 2026-07-01; Budget 2026 / Bulletin RST 030).
- *  - SK: treated as taxable here pending confirmation against Bulletin PST-2.
+ *  - SK: taxable and flagged to verify against Bulletin PST-2 until launch.env
+ *    SK_SUPPLEMENTS says otherwise (exempt → no SK PST; taxable → flag cleared).
+ *  - launch.env REGISTERED_PROVINCIAL limits which provincial layers (goods AND
+ *    shipping) are charged at all; see parseTaxConfig / provincialLayers below.
  *  - QC: QST follows GST/HST treatment for these goods.
  *  - Shipping: GST/HST/QST follow the goods. MB RST applies to delivery charges
  *    from out-of-province vendors; SK PST applies when delivery originates outside
@@ -130,6 +133,178 @@ export function shippingProvincialLayers(shipFrom: Province): Partial<Record<Pro
   return layers;
 }
 
-export function rateName(kind: string, percent: string, province: Province) {
-  return kind === "GST" ? `GST ${percent}% (${province})` : `${province} ${kind} ${percent}%`;
+/**
+ * Spree requires tax rate names to be unique per store (case-insensitive,
+ * across all categories), so every category but the default one carries a
+ * suffix. The name is also the label customers see on each tax line.
+ */
+const RATE_NAME_SUFFIX: Record<CategoryKey, string> = {
+  supplements: "",
+  merchandise: " · Merchandise",
+  zero_rated_food: " · Zero-rated",
+  shipping: " · Shipping",
+};
+
+export function rateName(kind: string, percent: string, province: Province, category: CategoryKey) {
+  const base = kind === "GST" ? `GST ${percent}% (${province})` : `${province} ${kind} ${percent}%`;
+  return `${base}${RATE_NAME_SUFFIX[category]}`;
+}
+
+// ── launch.env inputs ───────────────────────────────────────────────────────
+
+export const PROVINCIAL_PROVINCES = Object.keys(PROVINCIAL) as Province[];
+
+/** Accountant's answer on SK PST for supplements (launch.env SK_SUPPLEMENTS). */
+export type SkSupplements = "taxable" | "exempt" | "unknown";
+
+export interface TaxConfig {
+  shipFrom: Province;
+  /** Provinces whose provincial layer (PST/RST/QST) is charged. GST/HST is always charged. */
+  registeredProvincial: Province[];
+  skSupplements: SkSupplements;
+}
+
+/**
+ * Reads SHIP_FROM_PROVINCE, REGISTERED_PROVINCIAL and SK_SUPPLEMENTS (launch.env).
+ * Blank values fall back (and say so in `warnings`); invalid values throw.
+ */
+export function parseTaxConfig(env: Record<string, string | undefined>): { config: TaxConfig; warnings: string[] } {
+  const warnings: string[] = [];
+
+  let shipFrom = env.SHIP_FROM_PROVINCE?.trim().toUpperCase() as Province | "" | undefined;
+  if (!shipFrom) {
+    shipFrom = "BC";
+    warnings.push("SHIP_FROM_PROVINCE is blank: assuming BC.");
+  } else if (!PROVINCES.includes(shipFrom)) {
+    throw new Error(`SHIP_FROM_PROVINCE=${shipFrom} is not a province code (${PROVINCES.join(", ")}).`);
+  }
+
+  const listed = (env.REGISTERED_PROVINCIAL ?? "")
+    .split(/[\s,]+/)
+    .map((p) => p.trim().toUpperCase())
+    .filter(Boolean);
+  let registeredProvincial: Province[];
+  if (!listed.length) {
+    registeredProvincial = [...PROVINCIAL_PROVINCES];
+    warnings.push(
+      `REGISTERED_PROVINCIAL is blank: charging provincial tax in all of ${PROVINCIAL_PROVINCES.join(", ")} (staging only; fix before launch).`,
+    );
+  } else {
+    const invalid = listed.filter((p) => !PROVINCIAL_PROVINCES.includes(p as Province));
+    if (invalid.length) {
+      throw new Error(
+        `REGISTERED_PROVINCIAL has ${invalid.join(", ")}; only ${PROVINCIAL_PROVINCES.join(", ")} have a provincial layer (GST/HST is always charged).`,
+      );
+    }
+    registeredProvincial = PROVINCIAL_PROVINCES.filter((p) => listed.includes(p));
+  }
+
+  let skSupplements = env.SK_SUPPLEMENTS?.trim().toLowerCase() as SkSupplements | "" | undefined;
+  if (!skSupplements) {
+    skSupplements = "unknown";
+    warnings.push("SK_SUPPLEMENTS is blank: treating SK PST on supplements as taxable, flagged to verify.");
+  } else if (!["taxable", "exempt", "unknown"].includes(skSupplements)) {
+    throw new Error(`SK_SUPPLEMENTS=${skSupplements} must be taxable, exempt or unknown.`);
+  }
+
+  return { config: { shipFrom, registeredProvincial, skSupplements }, warnings };
+}
+
+// ── The resolved matrix ─────────────────────────────────────────────────────
+
+type Layers = Partial<Record<Province, { verify?: boolean }>>;
+
+/** Provincial layers charged on a category once launch.env is applied. */
+export function provincialLayers(category: CategoryKey, config: TaxConfig): Layers {
+  const layers: Layers = {
+    ...(category === "shipping" ? shippingProvincialLayers(config.shipFrom) : CATEGORY_RULES[category].provincial),
+  };
+  if (category === "supplements") {
+    if (config.skSupplements === "exempt") delete layers.SK;
+    else layers.SK = config.skSupplements === "taxable" ? {} : { verify: true };
+  }
+  for (const province of Object.keys(layers) as Province[]) {
+    if (!config.registeredProvincial.includes(province)) delete layers[province];
+  }
+  return layers;
+}
+
+export interface RateSpec {
+  /** Stable id stored as metadata.vantage_key on the Spree tax rate. */
+  key: string;
+  category: CategoryKey;
+  province: Province;
+  kind: string;
+  name: string;
+  percent: string;
+  verify: boolean;
+}
+
+/** Every tax rate the seed should hold, for all categories and provinces. */
+export function taxRates(config: TaxConfig): RateSpec[] {
+  const out: RateSpec[] = [];
+  for (const category of Object.keys(CATEGORY_RULES) as CategoryKey[]) {
+    const layers = provincialLayers(category, config);
+    for (const province of PROVINCES) {
+      if (CATEGORY_RULES[category].federal) {
+        const fed = FEDERAL[province];
+        out.push({
+          key: `${category}:${province}:${fed.kind}`,
+          category,
+          province,
+          kind: fed.kind,
+          name: rateName(fed.kind, fed.percent, province, category),
+          percent: fed.percent,
+          verify: false,
+        });
+      }
+      const layer = layers[province];
+      const prov = PROVINCIAL[province];
+      if (layer && prov) {
+        out.push({
+          key: `${category}:${province}:${prov.kind}`,
+          category,
+          province,
+          kind: prov.kind,
+          name: rateName(prov.kind, prov.percent, province, category),
+          percent: prov.percent,
+          verify: Boolean(layer.verify),
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/** Rates charged on one category delivered to one province. */
+export function ratesFor(config: TaxConfig, category: CategoryKey, province: Province): RateSpec[] {
+  return taxRates(config).filter((r) => r.category === category && r.province === province);
+}
+
+function decimal(value: string): { n: bigint; d: bigint } {
+  const m = /^(\d+)(?:\.(\d+))?$/.exec(value.trim());
+  if (!m) throw new Error(`Not a non-negative decimal: ${value}`);
+  const frac = m[2] ?? "";
+  return { n: BigInt(m[1] + frac), d: 10n ** BigInt(frac.length) };
+}
+
+/** Converts a decimal amount ("59.99") to integer cents. */
+export function toCents(amount: string): number {
+  const { n, d } = decimal(amount);
+  const cents = (n * 100n * 2n + d) / (2n * d);
+  return Number(cents);
+}
+
+/**
+ * Tax on `amountCents` at `percent`, rounded half up to the cent: the rounding
+ * Spree's internal tax provider applies per line and per rate.
+ */
+export function taxCents(amountCents: number, percent: string): number {
+  const { n, d } = decimal(percent);
+  const denom = d * 100n;
+  return Number((BigInt(amountCents) * n * 2n + denom) / (2n * denom));
+}
+
+export function formatCents(cents: number): string {
+  return `${cents < 0 ? "-" : ""}${Math.floor(Math.abs(cents) / 100)}.${String(Math.abs(cents) % 100).padStart(2, "0")}`;
 }

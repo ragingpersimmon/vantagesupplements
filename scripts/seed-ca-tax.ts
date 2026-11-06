@@ -5,88 +5,35 @@
  *   pnpm seed:tax              # apply
  *   pnpm seed:tax --dry-run    # print the plan, change nothing
  *
+ * Reads SHIP_FROM_PROVINCE, REGISTERED_PROVINCIAL and SK_SUPPLEMENTS from
+ * ../launch.env (scripts/.env wins for SHIP_FROM_PROVINCE); see parseTaxConfig.
+ *
  * Idempotent: every record the script owns is tagged (tax rates via
  * metadata.vantage_key, categories via tax_code, delivery methods via code).
  * Re-running updates changed rates in place and removes Vantage-owned rates no
  * longer in the matrix. Records created by hand in Spree Admin are never touched.
  */
-import type { TaxCategory, TaxRate } from "@spree/admin-sdk";
+import type { DeliveryMethod, TaxCategory, TaxRate } from "@spree/admin-sdk";
 import { adminClient, DRY_RUN, listAll, log } from "./lib/admin";
 import {
-  CATEGORY_RULES,
   type CategoryKey,
-  FEDERAL,
+  parseTaxConfig,
   PROVINCES,
-  PROVINCIAL,
-  type Province,
-  rateName,
-  shippingProvincialLayers,
+  type TaxConfig,
   TAX_CATEGORIES,
+  taxRates,
 } from "./lib/ca-tax-data";
-
-// ── Shipping configuration (CAD). Edit freely, then re-run. ─────────────────
-const FREE_STANDARD_THRESHOLD = "75.00";
-const EXPEDITED_DISCOUNT_THRESHOLD = "150.00";
-const SHIPPING = [
-  { code: "standard", name: "Standard (5–7 business days)", min: null, max: "74.99", amount: "12.99", days: [5, 7] },
-  { code: "standard-free", name: "Standard (5–7 business days)", min: FREE_STANDARD_THRESHOLD, max: null, amount: "0.00", days: [5, 7] },
-  { code: "expedited", name: "Expedited (2–3 business days)", min: null, max: "149.99", amount: "24.99", days: [2, 3] },
-  { code: "expedited-reduced", name: "Expedited (2–3 business days)", min: EXPEDITED_DISCOUNT_THRESHOLD, max: null, amount: "14.99", days: [2, 3] },
-] as const;
+import { SHIPPING } from "./lib/shipping-data";
 
 const admin = adminClient();
 
-const shipFrom = process.env.SHIP_FROM_PROVINCE as Province | undefined;
-if (!shipFrom || !PROVINCES.includes(shipFrom)) {
-  console.error(
-    "Set SHIP_FROM_PROVINCE to your warehouse province (e.g. BC, ON). It decides whether MB/SK tax shipping charges.",
-  );
+let taxConfig: TaxConfig;
+let configWarnings: string[];
+try {
+  ({ config: taxConfig, warnings: configWarnings } = parseTaxConfig(process.env));
+} catch (error) {
+  console.error((error as Error).message);
   process.exit(1);
-}
-
-interface DesiredRate {
-  key: string;
-  category: CategoryKey;
-  province: Province;
-  name: string;
-  percent: string;
-  verify: boolean;
-}
-
-function desiredRates(): DesiredRate[] {
-  const out: DesiredRate[] = [];
-  for (const category of Object.keys(CATEGORY_RULES) as CategoryKey[]) {
-    const rule = CATEGORY_RULES[category];
-    const provincialLayers =
-      category === "shipping" ? shippingProvincialLayers(shipFrom!) : rule.provincial;
-
-    for (const province of PROVINCES) {
-      if (rule.federal) {
-        const fed = FEDERAL[province];
-        out.push({
-          key: `${category}:${province}:${fed.kind}`,
-          category,
-          province,
-          name: rateName(fed.kind, fed.percent, province),
-          percent: fed.percent,
-          verify: false,
-        });
-      }
-      const layer = provincialLayers[province];
-      const prov = PROVINCIAL[province];
-      if (layer && prov) {
-        out.push({
-          key: `${category}:${province}:${prov.kind}`,
-          category,
-          province,
-          name: rateName(prov.kind, prov.percent, province),
-          percent: prov.percent,
-          verify: Boolean(layer.verify),
-        });
-      }
-    }
-  }
-  return out;
 }
 
 async function ensureCategories(): Promise<Record<CategoryKey, string>> {
@@ -116,15 +63,25 @@ async function syncRates(categoryIds: Record<CategoryKey, string>) {
       .filter((r) => typeof r.metadata?.vantage_key === "string")
       .map((r) => [r.metadata!.vantage_key as string, r]),
   );
-  const desired = desiredRates();
+  const desired = taxRates(taxConfig);
   const verifyRows: string[] = [];
+
+  // Seeded earlier but no longer in the matrix (e.g. a province left REGISTERED_PROVINCIAL).
+  // Removed first so a freed name can be reused below.
+  const wanted = new Set(desired.map((d) => d.key));
+  for (const [key, stale] of owned) {
+    if (wanted.has(key)) continue;
+    log("update", `remove stale ${stale.name} (${key})`);
+    if (!DRY_RUN) await admin.taxRates.delete(stale.id);
+  }
 
   for (const d of desired) {
     if (d.verify) verifyRows.push(`${TAX_CATEGORIES[d.category].name}: ${d.name}`);
     const params = {
       name: d.name,
       rate_percent: d.percent,
-      show_rate_in_label: true,
+      // The name already carries the percent; true would label lines "GST 5% (BC) 5%".
+      show_rate_in_label: false,
       tax_category_id: categoryIds[d.category],
       country_code: "CA" as const,
       state_code: d.province,
@@ -138,20 +95,69 @@ async function syncRates(categoryIds: Record<CategoryKey, string>) {
       const changed =
         Number(current.rate_percent) !== Number(d.percent) ||
         current.name !== d.name ||
-        current.tax_category_id !== params.tax_category_id;
+        current.tax_category_id !== params.tax_category_id ||
+        current.state_code !== d.province ||
+        current.show_rate_in_label !== params.show_rate_in_label ||
+        Boolean(current.metadata?.vantage_verify) !== d.verify;
       if (changed && !DRY_RUN) await admin.taxRates.update(current.id, params);
       log(changed ? "update" : "keep", `${TAX_CATEGORIES[d.category].name} → ${d.name}`);
     }
-    owned.delete(d.key);
-  }
-
-  // Anything still in `owned` was seeded earlier but is no longer in the matrix.
-  for (const [key, stale] of owned) {
-    log("update", `remove stale ${stale.name} (${key})`);
-    if (!DRY_RUN) await admin.taxRates.delete(stale.id);
   }
 
   return { count: desired.length, verifyRows };
+}
+
+const sameAmount = (a: unknown, b: unknown) =>
+  a === null || a === undefined || a === "" ? b === null || b === undefined || b === "" : Number(a) === Number(b);
+
+interface DesiredMethod {
+  name: string;
+  admin_name: string;
+  fulfillment_provider: string;
+  storefront_visible: boolean;
+  estimated_transit_business_days_min: number;
+  estimated_transit_business_days_max: number;
+  tax_category_id: string;
+  delivery_zone_id: string;
+  calculator: { type: string; preferences: { amount: string; currency: string } };
+  rules: { type: string; preferences: { minimum_amount: string | null; maximum_amount: string | null } }[];
+}
+
+/** Fields that differ between Spree's delivery method and the desired config (empty = in sync). */
+function deliveryMethodDrift(found: DeliveryMethod, want: DesiredMethod): string[] {
+  const drift: string[] = [];
+  for (const key of [
+    "name",
+    "admin_name",
+    "fulfillment_provider",
+    "storefront_visible",
+    "estimated_transit_business_days_min",
+    "estimated_transit_business_days_max",
+    "tax_category_id",
+    "delivery_zone_id",
+  ] as const) {
+    if (found[key] !== want[key]) drift.push(key);
+  }
+  const calc = found.calculator as { type: string; preferences: Record<string, unknown> } | null;
+  if (
+    !calc ||
+    calc.type !== want.calculator.type ||
+    !sameAmount(calc.preferences.amount, want.calculator.preferences.amount) ||
+    (calc.preferences.currency ?? want.calculator.preferences.currency) !== want.calculator.preferences.currency
+  ) {
+    drift.push("calculator");
+  }
+  const rules = found.rules.filter((r) => r.active);
+  const [wantRule] = want.rules;
+  if (
+    rules.length !== 1 ||
+    rules[0].type !== wantRule.type ||
+    !sameAmount(rules[0].preferences.minimum_amount, wantRule.preferences.minimum_amount) ||
+    !sameAmount(rules[0].preferences.maximum_amount, wantRule.preferences.maximum_amount)
+  ) {
+    drift.push("rules");
+  }
+  return drift;
 }
 
 async function ensureShipping(shippingCategoryId: string) {
@@ -207,8 +213,12 @@ async function ensureShipping(shippingCategoryId: string) {
     };
     const found = methods.find((m) => m.code === params.code);
     if (found) {
-      log("update", `delivery method ${params.admin_name} @ $${s.amount}`);
-      if (!DRY_RUN) await admin.deliveryMethods.update(found.id, params);
+      const drift = deliveryMethodDrift(found, params);
+      if (drift.length && !DRY_RUN) await admin.deliveryMethods.update(found.id, params);
+      log(
+        drift.length ? "update" : "keep",
+        `delivery method ${params.admin_name} @ $${s.amount}${drift.length ? ` (${drift.join(", ")})` : ""}`,
+      );
     } else {
       log("create", `delivery method ${params.admin_name} @ $${s.amount}`);
       if (!DRY_RUN) await admin.deliveryMethods.create(params);
@@ -217,7 +227,13 @@ async function ensureShipping(shippingCategoryId: string) {
 }
 
 async function main() {
-  console.log(`Seeding Canadian tax + shipping (ship-from: ${shipFrom})${DRY_RUN ? " — DRY RUN" : ""}\n`);
+  const { shipFrom, registeredProvincial, skSupplements } = taxConfig;
+  console.log(`Seeding Canadian tax + shipping${DRY_RUN ? " — DRY RUN" : ""}`);
+  console.log(
+    `  ship-from: ${shipFrom} · provincial tax registered in: ${registeredProvincial.join(", ") || "none"} · SK supplements: ${skSupplements}\n`,
+  );
+  for (const w of configWarnings) console.warn(`⚠ ${w}`);
+  if (configWarnings.length) console.log("");
   const categoryIds = await ensureCategories();
   const { count, verifyRows } = await syncRates(categoryIds);
   await ensureShipping(categoryIds.shipping);
