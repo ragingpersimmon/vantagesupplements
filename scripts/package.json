@@ -6,7 +6,8 @@
     "seed:tax": "tsx --env-file=.env seed-ca-tax.ts",
     "seed:products": "tsx --env-file=.env seed-products.ts",
     "seed": "pnpm seed:tax && pnpm seed:products",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "llm": "tsx --env-file-if-exists=../launch.env local-llm.ts"
   },
   "dependencies": {
     "@spree/admin-sdk": "^6.0.2"

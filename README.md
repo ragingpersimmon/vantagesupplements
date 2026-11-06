@@ -1,5 +1,10 @@
 # Vantage Supplements — headless commerce platform
 
+> **Running the build with an agent?** Fill `launch.env.example` → save as `launch.env`, start
+> your local LLM server (optional), open Claude Code in this repo, and say **"Do Phase 1."**
+> Then Phase 2, and so on, one per session (`/clear` between them). The model and effort for each
+> phase are in `CLAUDE.md`. Progress goes to `docs/LAUNCH_LOG.md`.
+
 A Canadian DTC supplement storefront built from existing commerce pieces:
 
 | Layer | Tech | Source |
