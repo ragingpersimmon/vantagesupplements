@@ -3,6 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "sync-env": "tsx sync-env.ts",
+    "setup-store": "tsx --env-file=.env setup-store.ts",
     "seed:tax": "tsx --env-file=.env seed-ca-tax.ts",
     "seed:products": "tsx --env-file=.env seed-products.ts",
     "seed": "pnpm seed:tax && pnpm seed:products",
