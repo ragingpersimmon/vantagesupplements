@@ -5,14 +5,17 @@
   "scripts": {
     "sync-env": "tsx sync-env.ts",
     "setup-store": "tsx --env-file=.env setup-store.ts",
-    "seed:tax": "tsx --env-file=.env seed-ca-tax.ts",
+    "seed:tax": "tsx --env-file-if-exists=../launch.env --env-file=.env seed-ca-tax.ts",
     "seed:products": "tsx --env-file=.env seed-products.ts",
     "seed": "pnpm seed:tax && pnpm seed:products",
+    "verify:tax": "tsx --env-file-if-exists=../launch.env --env-file=.env verify-tax.ts",
+    "test": "tsx --test lib/*.test.ts",
     "typecheck": "tsc --noEmit",
     "llm": "tsx --env-file-if-exists=../launch.env local-llm.ts"
   },
   "dependencies": {
-    "@spree/admin-sdk": "^6.0.2"
+    "@spree/admin-sdk": "^6.0.2",
+    "@spree/sdk": "^6.0.3"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
